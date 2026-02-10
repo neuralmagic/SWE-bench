@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 
-"""This python script is designed to run inference on a dataset using either the OpenAI or Anthropic API, depending on the model specified.
-It sorts instances by length and continually writes the outputs to a specified file, so that the script can be stopped and restarted without losing progress.
+"""Run inference on a dataset using the OpenAI API, Anthropic API, or an OpenAI-compatible local server (e.g. vLLM).
+
+Supports OpenAI and Anthropic by model name; use --api_base to point at a local
+OpenAI-compatible endpoint (e.g. http://localhost:8000/v1 for vLLM). Instances are
+sorted by length and outputs are written incrementally so the script can be stopped
+and restarted without losing progress.
 """
 
 import json
@@ -111,42 +115,68 @@ def calc_cost(model_name, input_tokens, output_tokens):
 
 
 @retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(3))
-def call_chat(model_name_or_path, inputs, use_azure, temperature, top_p, **model_args):
+def call_chat(
+    model_name_or_path,
+    inputs,
+    use_azure,
+    temperature,
+    top_p,
+    api_base=None,
+    api_key=None,
+    **model_args,
+):
     """
-    Calls the openai API to generate completions for the given inputs.
+    Calls the openai API (or an OpenAI-compatible endpoint) to generate completions.
 
     Args:
-    model_name_or_path (str): The name or path of the model to use.
-    inputs (str): The inputs to generate completions for.
-    use_azure (bool): Whether to use the azure API.
-    temperature (float): The temperature to use.
-    top_p (float): The top_p to use.
-    **model_args (dict): A dictionary of model arguments.
+        model_name_or_path (str): The name or path of the model to use.
+        inputs (str): The inputs to generate completions for.
+        use_azure (bool): Whether to use the azure API.
+        temperature (float): The temperature to use.
+        top_p (float): The top_p to use.
+        api_base (str, optional): Base URL for OpenAI-compatible API (e.g. vLLM). If set, this endpoint is used and cost is 0.
+        api_key (str, optional): API key for the endpoint. When api_base is set, defaults to "dummy" if not provided.
+        **model_args: Additional model arguments.
     """
     system_messages = inputs.split("\n", 1)[0]
     user_message = inputs.split("\n", 1)[1]
+    messages = [
+        {"role": "system", "content": system_messages},
+        {"role": "user", "content": user_message},
+    ]
+    kwargs = dict(
+        temperature=temperature,
+        top_p=top_p,
+        **model_args,
+    )
     try:
+        if api_base is not None:
+            client = openai.OpenAI(
+                base_url=api_base,
+                api_key=api_key or "dummy",
+            )
+            response = client.chat.completions.create(
+                model=model_name_or_path,
+                messages=messages,
+                **kwargs,
+            )
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                logger.info(
+                    f"input_tokens={response.usage.prompt_tokens}, output_tokens={response.usage.completion_tokens}"
+                )
+            return response, 0.0
         if use_azure:
             response = openai.chat.completions.create(
                 engine=ENGINES[model_name_or_path] if use_azure else None,
-                messages=[
-                    {"role": "system", "content": system_messages},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=temperature,
-                top_p=top_p,
-                **model_args,
+                messages=messages,
+                **kwargs,
             )
         else:
             response = openai.chat.completions.create(
                 model=model_name_or_path,
-                messages=[
-                    {"role": "system", "content": system_messages},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=temperature,
-                top_p=top_p,
-                **model_args,
+                messages=messages,
+                **kwargs,
             )
         input_tokens = response.usage.prompt_tokens
         output_tokens = response.usage.completion_tokens
@@ -240,6 +270,67 @@ def openai_inference(
             if max_cost is not None and total_cost >= max_cost:
                 print(f"Reached max cost {max_cost}, exiting")
                 break
+
+
+def local_openai_inference(
+    test_dataset,
+    model_name_or_path,
+    output_file,
+    model_args,
+    existing_ids,
+    api_base,
+    api_key,
+    max_context_length,
+):
+    """
+    Runs inference on a dataset using an OpenAI-compatible API (e.g. vLLM).
+
+    Args:
+        test_dataset (datasets.Dataset): The dataset to run inference on.
+        model_name_or_path (str): The model name as exposed by the server (e.g. HuggingFace model id).
+        output_file (str): The path to the output file.
+        model_args (dict): A dictionary of model arguments.
+        existing_ids (set): A set of ids that have already been processed.
+        api_base (str): Base URL of the OpenAI-compatible API (e.g. http://localhost:8000/v1).
+        api_key (str): Optional API key for the endpoint.
+        max_context_length (int): Maximum context length for filtering instances (approximate, via cl100k_base).
+    """
+    encoding = tiktoken.get_encoding("cl100k_base")
+    test_dataset = test_dataset.filter(
+        lambda x: gpt_tokenize(x["text"], encoding) <= max_context_length,
+        desc="Filtering",
+        load_from_cache_file=False,
+    )
+    temperature = model_args.pop("temperature", 0.2)
+    top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
+    print(f"Using api_base={api_base}, temperature={temperature}, top_p={top_p}")
+    basic_args = {"model_name_or_path": model_name_or_path}
+    print(f"Filtered to {len(test_dataset)} instances")
+    with open(output_file, "a+") as f:
+        for datum in tqdm(test_dataset, desc=f"Inference for {model_name_or_path}"):
+            instance_id = datum["instance_id"]
+            if instance_id in existing_ids:
+                continue
+            output_dict = {"instance_id": instance_id}
+            output_dict.update(basic_args)
+            output_dict["text"] = f"{datum['text']}\n\n"
+            result = call_chat(
+                output_dict["model_name_or_path"],
+                output_dict["text"],
+                use_azure=False,
+                temperature=temperature,
+                top_p=top_p,
+                api_base=api_base,
+                api_key=api_key,
+            )
+            if result is None:
+                logger.warning(f"Skipping {instance_id} (e.g. context length exceeded)")
+                continue
+            response, _ = result
+            completion = response.choices[0].message.content
+            output_dict["full_output"] = completion
+            output_dict["model_patch"] = extract_diff(completion)
+            print(json.dumps(output_dict), file=f, flush=True)
 
 
 @retry(wait=wait_random_exponential(min=60, max=600), stop=stop_after_attempt(6))
@@ -448,6 +539,9 @@ def main(
     output_dir,
     model_args,
     max_cost,
+    api_base=None,
+    api_key=None,
+    max_context_length=128000,
 ):
     if shard_id is None and num_shards is not None:
         logger.warning(
@@ -455,6 +549,15 @@ def main(
         )
     if shard_id is not None and num_shards is None:
         logger.warning(f"Received shard_id={shard_id} but num_shards is None, ignoring")
+    if api_base is None:
+        if not (
+            model_name_or_path.startswith("claude")
+            or model_name_or_path in MODEL_LIMITS
+        ):
+            raise ValueError(
+                f"Invalid model name or path {model_name_or_path}. "
+                "Use --api_base for OpenAI-compatible local servers (e.g. vLLM)."
+            )
     model_args = parse_model_args(model_args)
     model_nickname = model_name_or_path
     if "checkpoint" in Path(model_name_or_path).name:
@@ -499,7 +602,14 @@ def main(
         "existing_ids": existing_ids,
         "max_cost": max_cost,
     }
-    if model_name_or_path.startswith("claude"):
+    if api_base is not None:
+        local_openai_inference(
+            **inference_args,
+            api_base=api_base,
+            api_key=api_key,
+            max_context_length=max_context_length,
+        )
+    elif model_name_or_path.startswith("claude"):
         anthropic_inference(**inference_args)
     elif model_name_or_path.startswith("gpt"):
         openai_inference(**inference_args)
@@ -525,8 +635,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        help="Name of API model. Update MODEL* constants in this file to add new models.",
-        choices=sorted(list(MODEL_LIMITS.keys())),
+        required=True,
+        help="Name of API model (e.g. gpt-4, claude-2). With --api_base, use the model name exposed by the server (e.g. HuggingFace model id).",
     )
     parser.add_argument(
         "--shard_id",
@@ -559,5 +669,25 @@ if __name__ == "__main__":
         default=None,
         help="Maximum cost to spend on inference.",
     )
+    parser.add_argument(
+        "--api_base",
+        type=str,
+        default=None,
+        help="Base URL of an OpenAI-compatible API (e.g. http://localhost:8000/v1 for vLLM). When set, inference uses this endpoint and --model_name_or_path is the server's model name.",
+    )
+    parser.add_argument(
+        "--api_key",
+        type=str,
+        default=None,
+        help="API key for the endpoint given by --api_base. Defaults to OPENAI_API_KEY or 'dummy' when --api_base is set.",
+    )
+    parser.add_argument(
+        "--max_context_length",
+        type=int,
+        default=128000,
+        help="Maximum context length for filtering instances when using --api_base (approximate, via cl100k_base tokenizer). Ignored for OpenAI/Anthropic.",
+    )
     args = parser.parse_args()
+    if args.api_base is not None and args.api_key is None:
+        args.api_key = os.environ.get("OPENAI_API_KEY", "dummy")
     main(**vars(args))
