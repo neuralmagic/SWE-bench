@@ -281,6 +281,7 @@ def local_openai_inference(
     api_base,
     api_key,
     max_context_length,
+    max_cost=None,
 ):
     """
     Runs inference on a dataset using an OpenAI-compatible API (e.g. vLLM).
@@ -294,6 +295,7 @@ def local_openai_inference(
         api_base (str): Base URL of the OpenAI-compatible API (e.g. http://localhost:8000/v1).
         api_key (str): Optional API key for the endpoint.
         max_context_length (int): Maximum context length for filtering instances (approximate, via cl100k_base).
+        max_cost (float, optional): Ignored for local inference; accepted for a consistent inference_args interface.
     """
     encoding = tiktoken.get_encoding("cl100k_base")
     test_dataset = test_dataset.filter(
