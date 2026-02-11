@@ -570,6 +570,7 @@ def main(
     if shard_id is not None and num_shards is not None:
         output_file += f"__shard-{shard_id}__num_shards-{num_shards}"
     output_file = Path(output_dir, output_file + ".jsonl")
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     logger.info(f"Will write to {output_file}")
     existing_ids = set()
     if os.path.exists(output_file):
