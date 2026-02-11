@@ -13,6 +13,7 @@ import os
 import time
 import dotenv
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tqdm.auto import tqdm
 import numpy as np
@@ -272,6 +273,39 @@ def openai_inference(
                 break
 
 
+def _local_openai_one(
+    datum,
+    model_name_or_path,
+    temperature,
+    top_p,
+    api_base,
+    api_key,
+):
+    """Run one local OpenAI-compatible request; returns (instance_id, output_dict or None)."""
+    instance_id = datum["instance_id"]
+    output_dict = {
+        "instance_id": instance_id,
+        "model_name_or_path": model_name_or_path,
+        "text": f"{datum['text']}\n\n",
+    }
+    result = call_chat(
+        model_name_or_path,
+        output_dict["text"],
+        use_azure=False,
+        temperature=temperature,
+        top_p=top_p,
+        api_base=api_base,
+        api_key=api_key,
+    )
+    if result is None:
+        return (instance_id, None)
+    response, _ = result
+    completion = response.choices[0].message.content
+    output_dict["full_output"] = completion
+    output_dict["model_patch"] = extract_diff(completion)
+    return (instance_id, output_dict)
+
+
 def local_openai_inference(
     test_dataset,
     model_name_or_path,
@@ -282,6 +316,7 @@ def local_openai_inference(
     api_key,
     max_context_length,
     max_cost=None,
+    max_concurrent_requests=64,
 ):
     """
     Runs inference on a dataset using an OpenAI-compatible API (e.g. vLLM).
@@ -296,6 +331,7 @@ def local_openai_inference(
         api_key (str): Optional API key for the endpoint.
         max_context_length (int): Maximum context length for filtering instances (approximate, via cl100k_base).
         max_cost (float, optional): Ignored for local inference; accepted for a consistent inference_args interface.
+        max_concurrent_requests (int): Max in-flight requests when using --api_base (default 1 = sequential).
     """
     encoding = tiktoken.get_encoding("cl100k_base")
     test_dataset = test_dataset.filter(
@@ -305,34 +341,48 @@ def local_openai_inference(
     )
     temperature = model_args.pop("temperature", 0.2)
     top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
-    print(f"Using api_base={api_base}, temperature={temperature}, top_p={top_p}")
-    basic_args = {"model_name_or_path": model_name_or_path}
-    print(f"Filtered to {len(test_dataset)} instances")
+    print(f"Using api_base={api_base}, temperature={temperature}, top_p={top_p}, max_concurrent_requests={max_concurrent_requests}")
+    to_process = [
+        datum for datum in test_dataset
+        if datum["instance_id"] not in existing_ids
+    ]
+    print(f"Filtered to {len(to_process)} instances to process")
+    if not to_process:
+        return
     with open(output_file, "a+") as f:
-        for datum in tqdm(test_dataset, desc=f"Inference for {model_name_or_path}"):
-            instance_id = datum["instance_id"]
-            if instance_id in existing_ids:
-                continue
-            output_dict = {"instance_id": instance_id}
-            output_dict.update(basic_args)
-            output_dict["text"] = f"{datum['text']}\n\n"
-            result = call_chat(
-                output_dict["model_name_or_path"],
-                output_dict["text"],
-                use_azure=False,
-                temperature=temperature,
-                top_p=top_p,
-                api_base=api_base,
-                api_key=api_key,
-            )
-            if result is None:
-                logger.warning(f"Skipping {instance_id} (e.g. context length exceeded)")
-                continue
-            response, _ = result
-            completion = response.choices[0].message.content
-            output_dict["full_output"] = completion
-            output_dict["model_patch"] = extract_diff(completion)
-            print(json.dumps(output_dict), file=f, flush=True)
+        if max_concurrent_requests <= 1:
+            for datum in tqdm(to_process, desc=f"Inference for {model_name_or_path}"):
+                instance_id, output_dict = _local_openai_one(
+                    datum, model_name_or_path, temperature, top_p, api_base, api_key
+                )
+                if output_dict is None:
+                    logger.warning(f"Skipping {instance_id} (e.g. context length exceeded)")
+                    continue
+                print(json.dumps(output_dict), file=f, flush=True)
+        else:
+            with ThreadPoolExecutor(max_workers=max_concurrent_requests) as executor:
+                future_to_datum = {
+                    executor.submit(
+                        _local_openai_one,
+                        datum,
+                        model_name_or_path,
+                        temperature,
+                        top_p,
+                        api_base,
+                        api_key,
+                    ): datum
+                    for datum in to_process
+                }
+                for future in tqdm(as_completed(future_to_datum), total=len(future_to_datum), desc=f"Inference for {model_name_or_path}"):
+                    try:
+                        instance_id, output_dict = future.result()
+                    except Exception as e:
+                        logger.exception(f"Request failed: {e}")
+                        continue
+                    if output_dict is None:
+                        logger.warning(f"Skipping {instance_id} (e.g. context length exceeded)")
+                        continue
+                    print(json.dumps(output_dict), file=f, flush=True)
 
 
 @retry(wait=wait_random_exponential(min=60, max=600), stop=stop_after_attempt(6))
@@ -544,6 +594,7 @@ def main(
     api_base=None,
     api_key=None,
     max_context_length=128000,
+    max_concurrent_requests=64,
 ):
     if shard_id is None and num_shards is not None:
         logger.warning(
@@ -611,6 +662,7 @@ def main(
             api_base=api_base,
             api_key=api_key,
             max_context_length=max_context_length,
+            max_concurrent_requests=max_concurrent_requests,
         )
     elif model_name_or_path.startswith("claude"):
         anthropic_inference(**inference_args)
@@ -689,6 +741,12 @@ if __name__ == "__main__":
         type=int,
         default=128000,
         help="Maximum context length for filtering instances when using --api_base (approximate, via cl100k_base tokenizer). Ignored for OpenAI/Anthropic.",
+    )
+    parser.add_argument(
+        "--max_concurrent_requests",
+        type=int,
+        default=64,
+        help="Max in-flight requests when using --api_base (e.g. vLLM). Default 1 = sequential. Increase to use vLLM's parallel decoding.",
     )
     args = parser.parse_args()
     if args.api_base is not None and args.api_key is None:
